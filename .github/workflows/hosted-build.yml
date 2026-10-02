@@ -1,0 +1,74 @@
+name: Hosted Python build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_integration:
+        description: Run API-dependent integration tests (uses OPENAI_API_KEY and paid model calls)
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies on the hosted runner
+        run: python -m pip install '.[dev]' build twine pytest pip-audit ruff
+      - name: Audit dependencies before building
+        run: python -m pip_audit --strict
+      - name: Check Python syntax and names
+        run: |
+          git diff --check
+          ruff check src tests --select E9,F63,F7,F82
+      - name: Run credential-free unit tests
+        run: python -m pytest tests/utils/test_chunk_text.py -v
+      - name: Build fresh package distributions
+        run: python -m build --outdir ci-dist
+      - name: Validate package metadata
+        run: python -m twine check ci-dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: ci-dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  integration:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_integration
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Require model API credentials
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo '::error::Configure the OPENAI_API_KEY Actions secret before running API-dependent integration tests.'
+            exit 1
+          fi
+      - name: Install integration test dependencies on the hosted runner
+        run: python -m pip install '.[dev]' pytest python-dotenv
+      - name: Run the full test collection
+        run: python -m pytest tests -v
